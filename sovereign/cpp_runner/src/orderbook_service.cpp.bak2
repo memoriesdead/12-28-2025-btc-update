@@ -1,0 +1,209 @@
+/**
+ * Order Book Service - Standalone Pre-Caching Daemon
+ *
+ * PURE DATA. NO MOCK. MATH NEVER LIES.
+ *
+ * This runs as a background service to pre-cache order books from all
+ * configured exchanges. It writes the cached data to a JSON file that
+ * can be read by the Python trading engine.
+ *
+ * Usage:
+ *   ./orderbook_service [--output /path/to/orderbooks.json] [--interval 500]
+ *
+ * Output file is updated every interval (default 500ms) with fresh order book data.
+ */
+
+#include "order_book_types.hpp"
+#include "order_book_cache.hpp"
+#include "impact_calculator.hpp"
+#include "signal_handler.hpp"
+#include "rest_client.hpp"
+
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <thread>
+#include <csignal>
+#include <cstring>
+
+using namespace sovereign;
+
+// Global flag for shutdown
+static volatile sig_atomic_t g_running = 1;
+
+void signal_handler(int sig) {
+    g_running = 0;
+}
+
+/**
+ * Write order book cache to JSON file.
+ * Format is compatible with Python's json.load().
+ */
+void write_cache_json(const OrderBookCache& cache, const std::string& filepath) {
+    std::ofstream out(filepath);
+    if (!out.is_open()) {
+        std::cerr << "[ERROR] Cannot open " << filepath << " for writing\n";
+        return;
+    }
+
+    out << "{\n";
+    out << "  \"timestamp\": " << std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() << ",\n";
+    out << "  \"exchanges\": {\n";
+
+    bool first_exchange = true;
+    for (size_t i = 0; i < static_cast<size_t>(Exchange::COUNT); ++i) {
+        Exchange ex = static_cast<Exchange>(i);
+        OrderBook book = cache.get(ex);
+
+        if (!book.is_valid()) continue;
+
+        if (!first_exchange) out << ",\n";
+        first_exchange = false;
+
+        out << "    \"" << exchange_name(ex) << "\": {\n";
+        out << "      \"valid\": true,\n";
+        out << "      \"age_ms\": " << book.age_ms() << ",\n";
+        out << "      \"best_bid\": " << std::fixed << std::setprecision(2) << book.best_bid() << ",\n";
+        out << "      \"best_ask\": " << std::fixed << std::setprecision(2) << book.best_ask() << ",\n";
+        out << "      \"bid_depth\": " << std::fixed << std::setprecision(4) << book.total_bid_depth() << ",\n";
+        out << "      \"ask_depth\": " << std::fixed << std::setprecision(4) << book.total_ask_depth() << ",\n";
+
+        // Output bids
+        out << "      \"bids\": [\n";
+        for (size_t j = 0; j < book.bids.size() && j < 50; ++j) {
+            if (j > 0) out << ",\n";
+            out << "        [" << std::fixed << std::setprecision(2) << book.bids[j].price
+                << ", " << std::setprecision(8) << book.bids[j].volume << "]";
+        }
+        out << "\n      ],\n";
+
+        // Output asks
+        out << "      \"asks\": [\n";
+        for (size_t j = 0; j < book.asks.size() && j < 50; ++j) {
+            if (j > 0) out << ",\n";
+            out << "        [" << std::fixed << std::setprecision(2) << book.asks[j].price
+                << ", " << std::setprecision(8) << book.asks[j].volume << "]";
+        }
+        out << "\n      ]\n";
+        out << "    }";
+    }
+
+    out << "\n  }\n";
+    out << "}\n";
+    out.close();
+}
+
+/**
+ * Process a signal and output trade decision.
+ * This is called from stdin when the blockchain runner detects a signal.
+ */
+void process_stdin_signal(SignalHandler& handler, const std::string& line) {
+    // Parse: EXCHANGE DIRECTION AMOUNT
+    // Example: "gemini SHORT 10.5"
+    char exchange[64];
+    char direction[16];
+    double amount;
+
+    if (sscanf(line.c_str(), "%63s %15s %lf", exchange, direction, &amount) == 3) {
+        BlockchainSignal sig;
+        sig.exchange = exchange;
+        sig.is_inflow = (strcmp(direction, "SHORT") == 0 || strcmp(direction, "INFLOW") == 0);
+        sig.btc_amount = amount;
+        sig.timestamp = std::chrono::steady_clock::now();
+
+        handler.process_and_print(sig);
+        fflush(stdout);
+    }
+}
+
+void print_usage(const char* prog) {
+    std::cerr << "Usage: " << prog << " [options]\n"
+              << "Options:\n"
+              << "  --output FILE     Output JSON file path (default: /tmp/orderbooks.json)\n"
+              << "  --interval MS     Update interval in milliseconds (default: 500)\n"
+              << "  --stdin           Read signals from stdin and output trade decisions\n"
+              << "  --help            Show this help\n";
+}
+
+int main(int argc, char* argv[]) {
+    std::string output_path = "/tmp/orderbooks.json";
+    int interval_ms = 500;
+    bool stdin_mode = false;
+
+    // Parse arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
+            interval_ms = std::atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stdin") == 0) {
+            stdin_mode = true;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+
+    // Install signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    std::cout << "========================================\n";
+    std::cout << "SOVEREIGN ORDER BOOK SERVICE\n";
+    std::cout << "========================================\n";
+    std::cout << "Output: " << output_path << "\n";
+    std::cout << "Interval: " << interval_ms << "ms\n";
+    std::cout << "Mode: " << (stdin_mode ? "stdin signal processing" : "cache only") << "\n";
+    std::cout << "========================================\n\n";
+
+    // Initialize components
+    OrderBookCache cache;
+    RESTClient rest_client(cache);
+    SignalHandler handler(cache);
+
+    // Initial fetch
+    std::cout << "[SERVICE] Fetching initial order books...\n";
+    rest_client.fetch_all();
+    cache.print_status();
+    std::cout << "\n";
+
+    // Write initial cache
+    write_cache_json(cache, output_path);
+    std::cout << "[SERVICE] Wrote initial cache to " << output_path << "\n\n";
+
+    // Start REST polling
+    rest_client.set_polling_interval(interval_ms);
+    rest_client.start();
+
+    // Main loop
+    auto last_write = std::chrono::steady_clock::now();
+
+    while (g_running) {
+        if (stdin_mode) {
+            // Check for stdin input (non-blocking would be better but this works)
+            std::string line;
+            if (std::getline(std::cin, line)) {
+                if (!line.empty()) {
+                    process_stdin_signal(handler, line);
+                }
+            }
+        }
+
+        // Write cache periodically
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_write).count();
+
+        if (elapsed >= interval_ms) {
+            write_cache_json(cache, output_path);
+            last_write = now;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::cout << "\n[SERVICE] Shutting down...\n";
+    rest_client.stop();
+
+    return 0;
+}

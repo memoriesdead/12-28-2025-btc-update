@@ -1,0 +1,49 @@
+# Credentials - NEVER commit these
+*.pem
+*.key
+*.pub
+credentials.py
+*credentials*
+.env
+*.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+
+# Databases (large files - keep locally)
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Binary data (large files)
+*.bin
+*.tar
+*.gz
+*.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Temp files
+nul

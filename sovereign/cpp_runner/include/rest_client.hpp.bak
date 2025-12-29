@@ -1,0 +1,804 @@
+/**
+ * REST Client - HTTP Order Book Fetching
+ *
+ * PURE DATA. NO MOCK. MATH NEVER LIES.
+ *
+ * This provides REST API fallback for exchanges without WebSocket support
+ * (Zebpay, Phemex) or as backup when WebSocket disconnects.
+ *
+ * MULTI-INSTRUMENT SUPPORT:
+ * Fetches data for ALL 7 instrument types:
+ * - SPOT: /spot/depth or /api/v3/depth
+ * - MARGIN: Same as SPOT (shared order book)
+ * - PERPETUAL: /futures/depth or /fapi/v1/depth
+ * - FUTURES: /delivery/depth with expiration parameter
+ * - OPTIONS: /options/depth or /opt/depth
+ * - INVERSE: /inverse/depth or /dapi/v1/depth
+ * - LEVERAGED_TOKEN: Same as SPOT with token symbol
+ *
+ * Uses libcurl for HTTP and simdjson for nanosecond JSON parsing.
+ */
+
+#pragma once
+
+#include "order_book_types.hpp"
+#include "order_book_cache.hpp"
+#include <curl/curl.h>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <functional>
+#include <cstring>
+#include <vector>
+
+namespace sovereign {
+
+class RESTClient {
+public:
+    /**
+     * Constructor with cache reference.
+     */
+    explicit RESTClient(OrderBookCache& cache)
+        : cache_(cache) {
+        // Initialize libcurl
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        curl_ = curl_easy_init();
+        if (curl_) {
+            // Set common options
+            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response_buffer_);
+            curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 10L);
+            curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 5L);
+            curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L);
+            curl_easy_setopt(curl_, CURLOPT_USERAGENT, "SovereignTrader/1.0");
+            curl_easy_setopt(curl_, CURLOPT_PROXY, "http://141.147.58.130:8888");
+        }
+    }
+
+    ~RESTClient() {
+        stop();
+        if (curl_) {
+            curl_easy_cleanup(curl_);
+        }
+        curl_global_cleanup();
+    }
+
+    // Disable copy
+    RESTClient(const RESTClient&) = delete;
+    RESTClient& operator=(const RESTClient&) = delete;
+
+    /**
+     * Start background polling thread.
+     * Polls REST-only exchanges every polling_interval_ms.
+     */
+    void start() {
+        if (running_.load()) return;
+        running_.store(true);
+        poll_thread_ = std::thread(&RESTClient::poll_loop, this);
+    }
+
+    /**
+     * Stop background polling.
+     */
+    void stop() {
+        running_.store(false);
+        if (poll_thread_.joinable()) {
+            poll_thread_.join();
+        }
+    }
+
+    /**
+     * Check if running.
+     */
+    bool is_running() const { return running_.load(); }
+
+    /**
+     * Set polling interval in milliseconds.
+     */
+    void set_polling_interval(int ms) { polling_interval_ms_ = ms; }
+
+    /**
+     * Manually fetch order book for an exchange (blocking).
+     * Returns true on success.
+     */
+    bool fetch(Exchange exchange) {
+        if (!curl_) return false;
+
+        const auto& config = get_config(exchange);
+        if (strlen(config.rest_url) == 0) {
+            return false;  // No REST URL configured
+        }
+
+        // Clear response buffer
+        response_buffer_.clear();
+
+        // Set URL
+        curl_easy_setopt(curl_, CURLOPT_URL, config.rest_url);
+
+        // Perform request
+        CURLcode res = curl_easy_perform(curl_);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "[REST] %s fetch failed: %s\n",
+                    exchange_name(exchange), curl_easy_strerror(res));
+            return false;
+        }
+
+        // Check HTTP status
+        long http_code = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code != 200) {
+            fprintf(stderr, "[REST] %s HTTP %ld\n",
+                    exchange_name(exchange), http_code);
+            return false;
+        }
+
+        // Parse response
+        OrderBook book;
+        if (!parse_response(exchange, response_buffer_, book)) {
+            fprintf(stderr, "[REST] %s parse failed\n", exchange_name(exchange));
+            return false;
+        }
+
+        // Update cache
+        cache_.update(exchange, std::move(book));
+        return true;
+    }
+
+    /**
+     * Fetch all configured REST exchanges.
+     */
+    void fetch_all() {
+        for (size_t i = 0; i < static_cast<size_t>(Exchange::COUNT); ++i) {
+            Exchange ex = static_cast<Exchange>(i);
+            const auto& config = get_config(ex);
+
+            // Fetch if REST URL is configured
+            if (strlen(config.rest_url) > 0) {
+                fetch(ex);
+            }
+        }
+    }
+
+    /**
+     * Fetch only REST-only exchanges (no WebSocket).
+     */
+    void fetch_rest_only() {
+        for (size_t i = 0; i < static_cast<size_t>(Exchange::COUNT); ++i) {
+            Exchange ex = static_cast<Exchange>(i);
+            const auto& config = get_config(ex);
+
+            // Only fetch if no WebSocket (REST-only)
+            if (!config.has_websocket && strlen(config.rest_url) > 0) {
+                fetch(ex);
+            }
+        }
+    }
+
+    // ========================================================================
+    // MULTI-INSTRUMENT FETCH METHODS
+    // ========================================================================
+
+    /**
+     * Fetch order book for specific instrument type.
+     * Uses exchange-specific URL patterns for each instrument.
+     */
+    bool fetch_instrument(Exchange exchange, InstrumentType inst_type) {
+        if (!curl_) return false;
+
+        const auto& instruments = get_exchange_instruments(exchange);
+        const auto& inst_config = instruments.get(inst_type);
+
+        if (!inst_config.available || strlen(inst_config.orderbook_url) == 0) {
+            return false;  // Instrument not supported or no URL
+        }
+
+        // Clear response buffer
+        response_buffer_.clear();
+
+        // Set URL
+        curl_easy_setopt(curl_, CURLOPT_URL, inst_config.orderbook_url);
+
+        // Perform request
+        CURLcode res = curl_easy_perform(curl_);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "[REST] %s %s fetch failed: %s\n",
+                    exchange_name(exchange), instrument_name(inst_type),
+                    curl_easy_strerror(res));
+            return false;
+        }
+
+        // Check HTTP status
+        long http_code = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code != 200) {
+            fprintf(stderr, "[REST] %s %s HTTP %ld\n",
+                    exchange_name(exchange), instrument_name(inst_type), http_code);
+            return false;
+        }
+
+        // Parse response into InstrumentData
+        InstrumentData data;
+        if (!parse_instrument_response(exchange, inst_type, response_buffer_, data)) {
+            fprintf(stderr, "[REST] %s %s parse failed\n",
+                    exchange_name(exchange), instrument_name(inst_type));
+            return false;
+        }
+
+        // Update instrument cache
+        if (inst_cache_ptr_) {
+            inst_cache_ptr_->update(exchange, inst_type, std::move(data));
+        }
+        return true;
+    }
+
+    /**
+     * Fetch all instruments for an exchange.
+     */
+    void fetch_all_instruments(Exchange exchange) {
+        const auto& instruments = get_exchange_instruments(exchange);
+
+        for (size_t i = 0; i < static_cast<size_t>(InstrumentType::INST_COUNT); ++i) {
+            InstrumentType type = static_cast<InstrumentType>(i);
+            if (instruments.has(type)) {
+                fetch_instrument(exchange, type);
+            }
+        }
+    }
+
+    /**
+     * Fetch specific instrument from all exchanges.
+     */
+    void fetch_instrument_all_exchanges(InstrumentType inst_type) {
+        for (size_t i = 0; i < static_cast<size_t>(Exchange::COUNT); ++i) {
+            Exchange ex = static_cast<Exchange>(i);
+            const auto& instruments = get_exchange_instruments(ex);
+            if (instruments.has(inst_type)) {
+                fetch_instrument(ex, inst_type);
+            }
+        }
+    }
+
+    /**
+     * Set instrument cache reference.
+     */
+    void set_instrument_cache(InstrumentCache& cache) {
+        inst_cache_ptr_ = &cache;
+    }
+
+private:
+    OrderBookCache& cache_;
+    InstrumentCache* inst_cache_ptr_ = nullptr;
+    CURL* curl_ = nullptr;
+    std::string response_buffer_;
+
+    std::thread poll_thread_;
+    std::atomic<bool> running_{false};
+    int polling_interval_ms_ = 500;
+
+    // libcurl write callback
+    static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+        std::string* buffer = static_cast<std::string*>(userdata);
+        size_t total = size * nmemb;
+        buffer->append(ptr, total);
+        return total;
+    }
+
+    // Background polling loop
+    void poll_loop() {
+        while (running_.load()) {
+            fetch_rest_only();
+            std::this_thread::sleep_for(std::chrono::milliseconds(polling_interval_ms_));
+        }
+    }
+
+    /**
+     * Parse JSON response into OrderBook.
+     * Exchange-specific parsing logic.
+     */
+    bool parse_response(Exchange exchange, const std::string& json, OrderBook& book) {
+        // For now, use simple parsing
+        // TODO: Replace with simdjson for nanosecond performance
+
+        switch (exchange) {
+            case Exchange::GEMINI:
+                return parse_gemini(json, book);
+            case Exchange::DERIBIT:
+                return parse_deribit(json, book);
+            case Exchange::POLONIEX:
+                return parse_poloniex(json, book);
+            case Exchange::MEXC:
+                return parse_mexc(json, book);
+            case Exchange::ZEBPAY:
+                return parse_zebpay(json, book);
+            case Exchange::PHEMEX:
+                return parse_phemex(json, book);
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Parse JSON response into InstrumentData.
+     * Handles ALL 7 instrument types with exchange-specific logic.
+     */
+    bool parse_instrument_response(Exchange exchange, InstrumentType inst_type,
+                                    const std::string& json, InstrumentData& data) {
+        data.type = inst_type;
+
+        // Parse order book first (common to all instruments)
+        if (!parse_response(exchange, json, data.book)) {
+            return false;
+        }
+
+        // Set last price from order book
+        data.last_price = data.book.mid_price();
+
+        // Parse instrument-specific fields
+        switch (inst_type) {
+            case InstrumentType::SPOT:
+            case InstrumentType::MARGIN:
+                // SPOT/MARGIN: Just order book data
+                return true;
+
+            case InstrumentType::PERPETUAL:
+            case InstrumentType::INVERSE:
+                // PERPETUAL/INVERSE: Parse mark price and funding
+                parse_mark_and_funding(json, data);
+                return true;
+
+            case InstrumentType::FUTURES:
+                // FUTURES: Parse mark price, expiration, and basis
+                parse_mark_and_funding(json, data);
+                parse_futures_fields(json, data);
+                return true;
+
+            case InstrumentType::OPTIONS:
+                // OPTIONS: Parse Greeks and IV
+                parse_options_fields(json, data);
+                return true;
+
+            case InstrumentType::LEVERAGED_TOKEN:
+                // LEVERAGED_TOKEN: Parse NAV and rebalance
+                parse_leveraged_token_fields(json, data);
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * Parse mark price and funding rate from JSON.
+     */
+    void parse_mark_and_funding(const std::string& json, InstrumentData& data) {
+        // Find markPrice field
+        size_t pos = json.find("\"markPrice\"");
+        if (pos == std::string::npos) pos = json.find("\"mark_price\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            // Remove quotes if present
+            size_t q1 = val.find('"');
+            if (q1 != std::string::npos) {
+                size_t q2 = val.find('"', q1 + 1);
+                val = val.substr(q1 + 1, q2 - q1 - 1);
+            }
+            data.mark_price = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Find fundingRate field
+        pos = json.find("\"fundingRate\"");
+        if (pos == std::string::npos) pos = json.find("\"funding_rate\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            size_t q1 = val.find('"');
+            if (q1 != std::string::npos) {
+                size_t q2 = val.find('"', q1 + 1);
+                val = val.substr(q1 + 1, q2 - q1 - 1);
+            }
+            data.funding_rate = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Find indexPrice field
+        pos = json.find("\"indexPrice\"");
+        if (pos == std::string::npos) pos = json.find("\"index_price\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            size_t q1 = val.find('"');
+            if (q1 != std::string::npos) {
+                size_t q2 = val.find('"', q1 + 1);
+                val = val.substr(q1 + 1, q2 - q1 - 1);
+            }
+            data.index_price = std::strtod(val.c_str(), nullptr);
+        }
+    }
+
+    /**
+     * Parse futures-specific fields (expiration, basis).
+     */
+    void parse_futures_fields(const std::string& json, InstrumentData& data) {
+        // Find expiration timestamp
+        size_t pos = json.find("\"expirationTime\"");
+        if (pos == std::string::npos) pos = json.find("\"expiry\"");
+        if (pos == std::string::npos) pos = json.find("\"delivery_time\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.expiration_ts = std::strtoll(val.c_str(), nullptr, 10);
+        }
+
+        // Calculate basis
+        if (data.mark_price > 0 && data.index_price > 0) {
+            data.basis = data.mark_price - data.index_price;
+        }
+    }
+
+    /**
+     * Parse options-specific fields (strike, IV, Greeks).
+     */
+    void parse_options_fields(const std::string& json, InstrumentData& data) {
+        // Parse strike
+        size_t pos = json.find("\"strike\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.strike = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse IV
+        pos = json.find("\"impliedVolatility\"");
+        if (pos == std::string::npos) pos = json.find("\"iv\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.implied_vol = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse delta
+        pos = json.find("\"delta\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.delta = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse gamma
+        pos = json.find("\"gamma\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.gamma = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse theta
+        pos = json.find("\"theta\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.theta = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse vega
+        pos = json.find("\"vega\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.vega = std::strtod(val.c_str(), nullptr);
+        }
+    }
+
+    /**
+     * Parse leveraged token fields (NAV, rebalance).
+     */
+    void parse_leveraged_token_fields(const std::string& json, InstrumentData& data) {
+        // Parse NAV
+        size_t pos = json.find("\"nav\"");
+        if (pos == std::string::npos) pos = json.find("\"netAssetValue\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.nav = std::strtod(val.c_str(), nullptr);
+        }
+
+        // Parse real leverage
+        pos = json.find("\"realLeverage\"");
+        if (pos == std::string::npos) pos = json.find("\"leverage\"");
+        if (pos != std::string::npos) {
+            size_t colon = json.find(':', pos);
+            size_t comma = json.find_first_of(",}", colon);
+            std::string val = json.substr(colon + 1, comma - colon - 1);
+            data.real_leverage = std::strtod(val.c_str(), nullptr);
+        }
+    }
+
+    // ========================================================================
+    // EXCHANGE-SPECIFIC PARSERS
+    // ========================================================================
+
+    // Simple JSON helpers (to be replaced with simdjson)
+    static double parse_double(const char* str) {
+        return str ? std::strtod(str, nullptr) : 0.0;
+    }
+
+    static bool find_array(const std::string& json, const char* key,
+                           size_t& start, size_t& end) {
+        std::string search = "\"";
+        search += key;
+        search += "\"";
+
+        size_t pos = json.find(search);
+        if (pos == std::string::npos) return false;
+
+        start = json.find('[', pos);
+        if (start == std::string::npos) return false;
+
+        int depth = 1;
+        end = start + 1;
+        while (end < json.size() && depth > 0) {
+            if (json[end] == '[') depth++;
+            else if (json[end] == ']') depth--;
+            end++;
+        }
+        return depth == 0;
+    }
+
+    // Parse Gemini format: {"bids":[{"price":"87000","amount":"0.5"},...]}
+    bool parse_gemini(const std::string& json, OrderBook& book) {
+        size_t start, end;
+
+        // Parse bids
+        if (find_array(json, "bids", start, end)) {
+            parse_gemini_levels(json.substr(start, end - start), book.bids);
+        }
+
+        // Parse asks
+        if (find_array(json, "asks", start, end)) {
+            parse_gemini_levels(json.substr(start, end - start), book.asks);
+        }
+
+        return book.is_valid();
+    }
+
+    void parse_gemini_levels(const std::string& arr, std::vector<PriceLevel>& levels) {
+        // Simple extraction of price/amount from JSON array
+        size_t pos = 0;
+        while (pos < arr.size()) {
+            size_t price_pos = arr.find("\"price\"", pos);
+            if (price_pos == std::string::npos) break;
+
+            size_t colon = arr.find(':', price_pos);
+            size_t quote1 = arr.find('"', colon);
+            size_t quote2 = arr.find('"', quote1 + 1);
+            std::string price_str = arr.substr(quote1 + 1, quote2 - quote1 - 1);
+
+            size_t amount_pos = arr.find("\"amount\"", quote2);
+            if (amount_pos == std::string::npos) break;
+
+            colon = arr.find(':', amount_pos);
+            quote1 = arr.find('"', colon);
+            quote2 = arr.find('"', quote1 + 1);
+            std::string amount_str = arr.substr(quote1 + 1, quote2 - quote1 - 1);
+
+            double price = std::strtod(price_str.c_str(), nullptr);
+            double amount = std::strtod(amount_str.c_str(), nullptr);
+
+            if (price > 0 && amount > 0) {
+                levels.push_back({price, amount});
+            }
+
+            pos = quote2 + 1;
+        }
+    }
+
+    // Parse Deribit format: {"result":{"bids":[[price,amount],...],...}}
+    bool parse_deribit(const std::string& json, OrderBook& book) {
+        size_t start, end;
+
+        if (find_array(json, "bids", start, end)) {
+            parse_array_levels(json.substr(start, end - start), book.bids);
+        }
+
+        if (find_array(json, "asks", start, end)) {
+            parse_array_levels(json.substr(start, end - start), book.asks);
+        }
+
+        return book.is_valid();
+    }
+
+    // Parse Poloniex format: {"bids":["price1","amount1","price2","amount2",...]}
+    // Flat array of alternating price/amount strings
+    bool parse_poloniex(const std::string& json, OrderBook& book) {
+        size_t start, end;
+
+        if (find_array(json, "bids", start, end)) {
+            parse_poloniex_flat_array(json.substr(start, end - start), book.bids);
+        }
+
+        if (find_array(json, "asks", start, end)) {
+            parse_poloniex_flat_array(json.substr(start, end - start), book.asks);
+        }
+
+        return book.is_valid();
+    }
+
+    // Parse flat array: ["price1","amount1","price2","amount2",...]
+    void parse_poloniex_flat_array(const std::string& arr, std::vector<PriceLevel>& levels) {
+        size_t pos = 0;
+        bool is_price = true;
+        double current_price = 0.0;
+
+        while (pos < arr.size()) {
+            size_t quote1 = arr.find('"', pos);
+            if (quote1 == std::string::npos) break;
+
+            size_t quote2 = arr.find('"', quote1 + 1);
+            if (quote2 == std::string::npos) break;
+
+            std::string value_str = arr.substr(quote1 + 1, quote2 - quote1 - 1);
+            double value = std::strtod(value_str.c_str(), nullptr);
+
+            if (is_price) {
+                current_price = value;
+            } else {
+                if (current_price > 0 && value > 0) {
+                    levels.push_back({current_price, value});
+                }
+            }
+
+            is_price = !is_price;
+            pos = quote2 + 1;
+        }
+    }
+
+    // Parse MEXC format: {"bids":[["price","amount"],...],...}
+    bool parse_mexc(const std::string& json, OrderBook& book) {
+        size_t start, end;
+
+        if (find_array(json, "bids", start, end)) {
+            parse_string_array_levels(json.substr(start, end - start), book.bids);
+        }
+
+        if (find_array(json, "asks", start, end)) {
+            parse_string_array_levels(json.substr(start, end - start), book.asks);
+        }
+
+        return book.is_valid();
+    }
+
+    // Parse Zebpay format
+    bool parse_zebpay(const std::string& json, OrderBook& book) {
+        return parse_deribit(json, book);  // Adjust as needed
+    }
+
+    // Parse Phemex format: {"result":{"book":{"asks":[[price_ep,size],...], "bids":[[price_ep,size],...]}}}
+    // Phemex uses Ep format: prices are in 1/10000 units (87648.1 = 876481000)
+    // Sizes are in satoshis (0.0007938 BTC = 79380)
+    bool parse_phemex(const std::string& json, OrderBook& book) {
+        // Find the "book" object first
+        size_t book_pos = json.find("\"book\"");
+        if (book_pos == std::string::npos) return false;
+
+        size_t start, end;
+        std::string book_json = json.substr(book_pos);
+
+        if (find_array(book_json, "bids", start, end)) {
+            parse_phemex_levels(book_json.substr(start, end - start), book.bids);
+        }
+
+        if (find_array(book_json, "asks", start, end)) {
+            parse_phemex_levels(book_json.substr(start, end - start), book.asks);
+        }
+
+        return book.is_valid();
+    }
+
+    // Parse Phemex [[price_ep, size], ...] format with Ep conversion
+    void parse_phemex_levels(const std::string& arr, std::vector<PriceLevel>& levels) {
+        size_t pos = 0;
+        while (pos < arr.size()) {
+            // Find inner array start
+            size_t bracket = arr.find('[', pos);
+            if (bracket == std::string::npos) break;
+
+            // Skip if this is the outer array
+            if (bracket == 0) {
+                pos = 1;
+                continue;
+            }
+
+            size_t comma = arr.find(',', bracket);
+            if (comma == std::string::npos) break;
+
+            size_t end_bracket = arr.find(']', comma);
+            if (end_bracket == std::string::npos) break;
+
+            std::string price_str = arr.substr(bracket + 1, comma - bracket - 1);
+            std::string amount_str = arr.substr(comma + 1, end_bracket - comma - 1);
+
+            // Phemex Ep format: price / 10000, amount / 100000000
+            double price_ep = std::strtod(price_str.c_str(), nullptr);
+            double amount_raw = std::strtod(amount_str.c_str(), nullptr);
+
+            double price = price_ep / 10000.0;       // Convert from Ep
+            double amount = amount_raw / 100000000.0; // Convert from satoshis
+
+            if (price > 0 && amount > 0) {
+                levels.push_back({price, amount});
+            }
+
+            pos = end_bracket + 1;
+        }
+    }
+
+    // Parse [[price, amount], ...] format (numeric values)
+    void parse_array_levels(const std::string& arr, std::vector<PriceLevel>& levels) {
+        size_t pos = 0;
+        while (pos < arr.size()) {
+            size_t bracket = arr.find('[', pos);
+            if (bracket == std::string::npos) break;
+
+            size_t comma = arr.find(',', bracket);
+            if (comma == std::string::npos) break;
+
+            size_t end_bracket = arr.find(']', comma);
+            if (end_bracket == std::string::npos) break;
+
+            std::string price_str = arr.substr(bracket + 1, comma - bracket - 1);
+            std::string amount_str = arr.substr(comma + 1, end_bracket - comma - 1);
+
+            double price = std::strtod(price_str.c_str(), nullptr);
+            double amount = std::strtod(amount_str.c_str(), nullptr);
+
+            if (price > 0 && amount > 0) {
+                levels.push_back({price, amount});
+            }
+
+            pos = end_bracket + 1;
+        }
+    }
+
+    // Parse [["price", "amount"], ...] format (string values)
+    void parse_string_array_levels(const std::string& arr, std::vector<PriceLevel>& levels) {
+        size_t pos = 0;
+        while (pos < arr.size()) {
+            size_t bracket = arr.find('[', pos);
+            if (bracket == std::string::npos) break;
+
+            size_t quote1 = arr.find('"', bracket);
+            if (quote1 == std::string::npos) break;
+
+            size_t quote2 = arr.find('"', quote1 + 1);
+            std::string price_str = arr.substr(quote1 + 1, quote2 - quote1 - 1);
+
+            size_t quote3 = arr.find('"', quote2 + 1);
+            size_t quote4 = arr.find('"', quote3 + 1);
+            std::string amount_str = arr.substr(quote3 + 1, quote4 - quote3 - 1);
+
+            double price = std::strtod(price_str.c_str(), nullptr);
+            double amount = std::strtod(amount_str.c_str(), nullptr);
+
+            if (price > 0 && amount > 0) {
+                levels.push_back({price, amount});
+            }
+
+            size_t end_bracket = arr.find(']', quote4);
+            pos = (end_bracket != std::string::npos) ? end_bracket + 1 : arr.size();
+        }
+    }
+};
+
+} // namespace sovereign

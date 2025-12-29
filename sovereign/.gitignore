@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+
+# Databases (large files)
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Binary data
+*.bin
+*.tar
+*.gz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Credentials (never commit)
+credentials.py
+*credentials*
+*.pem
+*.key
